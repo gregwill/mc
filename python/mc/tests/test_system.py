@@ -19,6 +19,10 @@ class TestSystem(unittest.TestCase):
         except OSError:
             pass
 
+        for i in xrange(1000):
+            if os.path.isfile(ff):
+                break
+
         self.assertTrue(os.path.isfile(ff))
 
         shutil.rmtree(dd)

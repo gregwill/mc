@@ -1,0 +1,38 @@
+package mcmon;
+
+message Request {
+    extensions 100 to max;
+
+    enum Type {
+         REGISTER = 1;
+         DEAD = 2;
+    }
+
+    required Type type = 1;
+}
+
+message Register {
+    extend Request {
+       required Register request = 100;
+    }
+    required string plant = 1;
+    required string name  = 2;
+    required int32  pid   = 3;
+}
+
+message Dead {
+    extend Request {
+       required Dead request = 101;
+    }
+    optional int32 wait_result = 1;
+}
+
+
+message Response {
+    enum Type {
+         ACCEPT = 1;
+         REJECT = 2;
+    }
+
+    required Type type = 1;
+}
