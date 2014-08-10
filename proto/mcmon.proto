@@ -15,9 +15,10 @@ message Register {
     extend Request {
        required Register request = 100;
     }
-    required string plant = 1;
-    required string name  = 2;
-    required int32  pid   = 3;
+    required string plant       = 1;
+    required string name        = 2;
+    required int32  pid         = 3;
+    optional int32  wait_result = 4;
 }
 
 message Dead {

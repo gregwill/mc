@@ -1,9 +1,12 @@
 from twisted.internet.protocol import Factory, ReconnectingClientFactory
 from twisted.protocols.basic import Int32StringReceiver
 from twisted.internet.endpoints import UNIXServerEndpoint, UNIXClientEndpoint
+from twisted.internet import reactor, defer
 from mc.proto import mcmon_pb2 as proto
+import mc.util
 import logging
 import sys
+import argparse
 
 #States
 CONNECTED = 0
@@ -40,11 +43,11 @@ class ServerProtocol(Int32StringReceiver):
             resp = proto.Response()
             allow = self.callback.mcmon_connect_cb(reg.plant, reg.name, reg.pid)
             if allow:
-                logging.info("Accepting mcmon connection: {}".format(str(reg)))
+                logging.info("Accepting mcmon connection: {}".format(str(reg).replace("\n", ", ")))
                 self.state = ACCEPTED
                 resp.type = proto.Response.ACCEPT
             else:
-                logging.warn("Rejecting mcmon connection: {}".format(str(reg)))
+                logging.warn("Rejecting mcmon connection: {}".format(str(reg).replace("\n", ", ")))
                 self.state = REJECTED
                 resp.type = proto.Response.REJECT
             self.sendString(resp.SerializeToString())
@@ -70,15 +73,21 @@ class Server:
         self.reactor = reactor
         self.factory = ServerFactory(callback)
         self.endpoint = UNIXServerEndpoint(reactor, addr)
-        self.endpoint.listen(self.factory)
+        self.listen_deferred = self.endpoint.listen(self.factory)
         logging.info("mcmon server listening on {}".format(addr))
 
+    def stop(self):
+        self.stop_deferred = self.endpoint.stop_listening()
+        return self.stop_deferred
+
 class ClientProtocol(Int32StringReceiver):
-    def __init__(self, callback, plant, name, pid):
+    def __init__(self, callback, plant, name, pid, wait_result):
         self.callback = callback
         self.plant = plant
         self.name = name
         self.pid = pid
+        self.wait_result = wait_result
+        self.disconnecting = False
 
     def connectionMade(self):
         req = proto.Request()
@@ -87,24 +96,26 @@ class ClientProtocol(Int32StringReceiver):
         reg.plant = self.plant
         reg.name  = self.name
         reg.pid   = self.pid
+        if (self.wait_result is not None):
+            reg.wait_result = self.wait_result
         try:
             self.sendString(req.SerializeToString())
         except:
             logging.exception("Cannot send register message")
         self.state = CONNECTED
-        logging.info("Sending registration message: {}".format(str(reg)))
+        logging.info("Sending registration message: {}".format(str(reg).replace("\n", ", ")))
     
     def stringReceived(self, msg):
         resp = proto.Response()
         resp.ParseFromString(msg)
         if resp.type == proto.Response.ACCEPT:
-            logging.info("mcmon server accepted")
+            logging.info("mcmon server accepted registration")
             self.state = ACCEPTED;
+            self.callback.mcmon_accept_cb()
         elif resp.type == proto.Response.REJECT:
-            logging.error("mcmon server rejected registration - shutting down")
+            logging.error("mcmon server rejected registration")
             self.state = REJECTED
             self.callback.mcmon_reject_cb()
-            self.transport.lose_connection()
         else:
             logging.error("Unknown mcmon response type {}".format(resp.type))
 
@@ -115,43 +126,88 @@ class ClientProtocol(Int32StringReceiver):
         dead.wait_result = wait_result
         self.sendString(req.SerializeToString())
         self.state = DEAD
+        logging.info("Sending death certificate (wait_result={})".format(wait_result))
+
+    def disconnect(self):
+        self.disconnecting = True
+        self.transport.loseConnection()
 
     def connectionLost(self, reason):
-        logging.error("Connection to mcmon server lost")
+        if self.disconnecting:
+            logging.info("Disconnected from mcmon server")
+        else:
+            logging.error("Connection to mcmon server lost - {}".format(reason))
+        self.callback.mcmon_disconnect_cb()
 
 class ClientFactory(ReconnectingClientFactory):
-    def __init__(self, callback, plant, name, pid):
+    def __init__(self, callback, plant, name, pid, wait_result, deferred):
         self.callback = callback
         self.plant = plant
         self.name = name
         self.pid = pid
-        self.connection = None
+        self.wait_result = wait_result
+        self.deferred = deferred
 
     def buildProtocol(self, addr):
-        print("Constructing ClientProtocol")
-        self.connection = ClientProtocol(self.callback, self.plant, self.name, self.pid)
-        print("Constructing ClientProtocol2")
-        return self.connection
-
-    def clientConnectionLost(self, connector, reason):
-        if self.connection.state == REJECTED or self.connection.state == DEAD:
-            self.stopTrying()
-        self.connection = None
-        ReconnectingClientFactory.clientConnectionLost(self, connector, reason)
+        self.resetDelay()
+        p = ClientProtocol(self.callback, self.plant, self.name, self.pid, self.wait_result)
+        self.deferred.callback(p)
+        return p
 
 class Client:
-    def __init__(self, addr, reactor, callback, plant, name, pid):
+    def __init__(self, addr, reactor, callback, plant, name, pid, wait_result):
         self.addr = addr
         self.reactor = reactor
-        self.factory = ClientFactory(callback, plant, name, pid)
+        self.protocol = None
+        self.deferred = defer.Deferred()
+        self.deferred.addCallback(self.connected)
+        self.factory = ClientFactory(callback, plant, name, pid, wait_result, self.deferred)
         self.endpoint = UNIXClientEndpoint(reactor, addr)
-        self.endpoint.connect(self.factory)
+        
+    def connect(self):
+        return self.endpoint.connect(self.factory)
 
-    def notify_death(wait_result):
-        connection = self.factory.connection
-        if connection is None:
+    def disconnect(self):
+        if self.protocol is not None:
+            self.protocol.disconnect()
+        
+    def connected(self, protocol):
+        self.protocol = protocol
+
+    def notify_death(self, wait_result):
+        """Returns true if death ceritificate has been sent, false otherwise
+
+        """
+        if self.protocol is None:
             logging.error("Cannot report exit status because not connected")
-        elif connection.state == ACCEPTED:
-            connection.notify_death(wait_result)
+            return False
+        elif self.protocol.state == ACCEPTED:
+            self.protocol.notify_death(wait_result)
         else:
-            logging.info("Not notifying server of death because connection is not in ACCEPTED state (state = {})".format(connction.state))
+            logging.info("Not notifying server of death because connection is not in ACCEPTED state (state = {})".format(self.protocol.state))
+        return self.protocol.state >= ACCEPTED
+
+class NullHandler:
+    def __init__(self, reject):
+        self.reject = reject
+
+    def mcmon_connect_cb(self, plant, name, pid):
+        return not self.reject
+
+    def mcmon_disconnect_cb(self, plant, name, wait_result):
+        pass
+
+def main():
+    parser = argparse.ArgumentParser(description='mcmon')
+    parser.add_argument("--socket", help="unix domain socket", required=True)
+    parser.add_argument("--reject", help="Reject mcmon connections", action="store_true")
+    args = parser.parse_args()
+
+    mc.util.init_logging_to_stderr()
+
+    handler = NullHandler(args.reject)
+    server = Server(args.socket, reactor, handler)
+    reactor.run()
+
+if __name__ == "__main__":
+    main()

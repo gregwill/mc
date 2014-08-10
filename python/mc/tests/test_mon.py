@@ -14,11 +14,13 @@ class Handler:
         self.plant = None
         self.name = None
         self.connected = False
+        self.connection_count = 0
         self.disconnected = False
         self.rejected = False
 
     def mcmon_connect_cb(self, plant, name, pid):
         self.connected = True
+        self.connection_count = self.connection_count + 1
         self.plant = plant
         self.name = name
         self.pid = pid
@@ -44,10 +46,12 @@ class TestMon(unittest.TestCase):
             client_cb = Handler(reactor)
             server = mon.Server(addr, reactor, server_cb)
             client = mon.Client(addr, reactor, client_cb, "ACME", "foo", 1234)
+            client.connect()
             reactor.run()
             self.assertTrue(server_cb.connected)
             self.assertEqual("ACME", server_cb.plant)
             self.assertEqual("foo", server_cb.name)
             self.assertEqual(1234, server_cb.pid)
+            server.stop()
         finally:
             shutil.rmtree(dd)
